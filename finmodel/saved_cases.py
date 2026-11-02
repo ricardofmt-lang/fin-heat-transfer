@@ -1,20 +1,45 @@
-"""Predefined lecture cases from 'Lecture 13: Exercises with the Excel application'."""
+"""Pre-programmed benchmark cases (`Case 1` through `Case 14`) for teaching and exploration.
 
-from __future__ import annotations
+Pedagogical Overview
+--------------------
+These 14 saved cases cover the fundamental physical regimes of 1D conduction and
+extended-surface (fin) heat transfer:
+- **Case 1**: 1D steady/transient conduction across a slab with an imposed base
+  temperature ($400\\text{ K}$) and a convective right boundary ($h = 5000\\text{ W/(m}^2\\cdot\\text{K)}$,
+  $T_\\infty = 300\\text{ K}$), demonstrating series thermal resistances ($R_{\\text{cond}} + R_{\\text{conv}}$).
+- **Case 2**: Symmetric convective cooling of an initially hot slab ($400\\text{ K}$) from both
+  ends, demonstrating opposite-sign heat fluxes ($q < 0$ on the left, $q > 0$ on the right).
+- **Case 3**: Adiabatic redistribution of an initial central hot spot ($2000\\text{ K}$ in cells 9–10)
+  inside a fully insulated bar (`NoHeatFlux` on all boundaries), relaxing to the energy-conserving
+  mean temperature ($470\\text{ K}$).
+- **Case 4**: Two-layer composite bar ($k_1 = 600$, $k_2 = 300\\text{ W/(m}\\cdot\\text{K)}$), illustrating
+  continuity of heat flux $-k_1 \\frac{dT}{dx}\\big|_1 = -k_2 \\frac{dT}{dx}\\big|_2$ and the resulting $1:2$ slope kink.
+- **Case 5**: Two-layer composite bar with a local thermal contact resistance ($R''_c = 10^{-4}\\text{ m}^2\\cdot\\text{K/W}$),
+  illustrating the discrete temperature jump $\\Delta T = q'' R''_c$ across an imperfect interface.
+- **Case 6**: Classical convective fin with lateral convection ($h_{\\text{lat}} = 500\\text{ W/(m}^2\\cdot\\text{K)}$)
+  and tip convection ($h_{\\text{tip}} = 5000\\text{ W/(m}^2\\cdot\\text{K)}$).
+- **Cases 7–14**: Initial temperature gradients, radiative gas gaps, internal volumetric heat generation,
+  insulated-tip fins, equal-area cylindrical vs. rectangular fins, lateral thermal radiation,
+  and tapered pyramidal/conical fins.
+"""
 
-import copy
-from dataclasses import dataclass
-import math
-from typing import Any
+from __future__ import annotations  # Postpone evaluation of type annotations
 
-from finmodel.empty_inputs import blank_section, empty_numerical_config
+import copy  # Used to return fresh deep copies of case configurations so user edits never mutate the catalog
+from dataclasses import dataclass  # Used to bundle each case's title, description, and config dictionary
+import math  # Used to compute the equivalent circular diameter D = sqrt(4 * A_c / π)
+from typing import Any  # Generic type annotation for configuration dictionaries
+
+from finmodel.empty_inputs import blank_section, empty_numerical_config  # Base configuration builders
 
 
 @dataclass(frozen=True)
 class SavedCase:
-    name: str
-    description: str
-    config: dict[str, Any]
+    """Immutable descriptor for a pre-programmed teaching case."""
+
+    name: str  # Dropdown label shown in `"Load saved cases"` (e.g. `"Case 1: 1D conduction with convective right end"`)
+    description: str  # Pedagogical explanation displayed in an `st.info` box when the case is selected
+    config: dict[str, Any]  # Complete numerical configuration dictionary ready for the form and `simulate()`
 
 
 def _lecture_base_section(
@@ -28,84 +53,97 @@ def _lecture_base_section(
     gas_gap: bool = False,
     resistances: list[dict[str, float]] | None = None,
 ) -> dict[str, Any]:
+    """Create a populated axial section (`domain`) dictionary with default reference material properties."""
+    # Start from a blank section template so all required keys exist.
     sec = blank_section()
+    # Populate the section's geometric, thermophysical, and radiative properties.
     sec.update(
-        length_mm=length_mm,
-        gas_gap=gas_gap,
-        n_cells=1 if gas_gap else n_cells,
-        conductivity=conductivity,
-        thermal_capacity=thermal_capacity,
-        density=density,
-        heat_generated=heat_generated,
-        lateral_emissivity=0.8,
-        lateral_absorptivity=0.9,
-        right_emissivity=0.5,
-        right_absorptivity=0.4,
-        left_emissivity=0.5,
-        left_absorptivity=0.4,
-        gas_face_emissivity_left=0.8,
-        gas_face_emissivity_right=0.8,
-        gas_face_absorptivity_left=0.8,
-        gas_face_absorptivity_right=0.8,
-        resistances=list(resistances or []),
+        length_mm=length_mm,  # Section axial length L (mm)
+        gas_gap=gas_gap,  # True if this section represents a 1-cell radiative gas gap
+        n_cells=1 if gas_gap else n_cells,  # Number of finite-volume cells in this section
+        conductivity=conductivity,  # Thermal conductivity k (W/(m·K))
+        thermal_capacity=thermal_capacity,  # Specific heat capacity c_p (J/(kg·K))
+        density=density,  # Mass density ρ (kg/m³)
+        heat_generated=heat_generated,  # Volumetric internal heat generation rate q̇_gen (W/m³)
+        lateral_emissivity=0.8,  # Lateral surface emissivity ε_lat
+        lateral_absorptivity=0.9,  # Lateral surface absorptivity α_lat
+        right_emissivity=0.5,  # Right end-face emissivity ε_right
+        right_absorptivity=0.4,  # Right end-face absorptivity α_right
+        left_emissivity=0.5,  # Left end-face emissivity ε_left
+        left_absorptivity=0.4,  # Left end-face absorptivity α_left
+        gas_face_emissivity_left=0.8,  # Left bounding wall emissivity for a gas gap
+        gas_face_emissivity_right=0.8,  # Right bounding wall emissivity for a gas gap
+        gas_face_absorptivity_left=0.8,  # Left bounding wall absorptivity for a gas gap
+        gas_face_absorptivity_right=0.8,  # Right bounding wall absorptivity for a gas gap
+        resistances=list(resistances or []),  # List of `{distance_mm, value}` local contact resistances
     )
+    # Return the populated section dictionary.
     return sec
 
 
 def _lecture_base_config() -> dict[str, Any]:
-    """Base configuration matching the Slide 5 Excel screenshot defaults."""
+    """Build the baseline configuration (matching `Case 1`) from which other cases customize parameters."""
+    # Start from an empty configuration structure.
     cfg = empty_numerical_config()
+    # Set default time-stepping controls: Implicit scheme, 198 s duration, Δt = 0.3 s, print every 2 s.
     cfg["controls"].update(
         method="imp",
         duration_s=198.0,
         time_step_s=0.3,
         output_interval_s=2.0,
     )
+    # Set default rectangular cross-section: Width = 300 mm, Thickness = 10 mm (A_c = 0.003 m²).
     cfg["geometry"].update(
         shape="Rectangular",
         width_mm=300.0,
         thickness_mm=10.0,
     )
+    # Start with a single 50 mm, 20-cell section with k = 300 W/(m·K).
     cfg["domains"] = [_lecture_base_section()]
+    # Set default boundary and initial temperature settings.
     cfg["temperature"].update(
-        default_k=300.0,
-        minimum_k=173.0,
-        maximum_k=2000.0,
-        left_boundary="Temp",
-        left_temperature_k=400.0,
-        left_convection=50.0,
-        left_air_temperature_k=500.0,
-        left_radiation=False,
-        left_surround_k=330.0,
-        right_boundary="HeatFlux",
-        right_temperature_k=350.0,
-        right_convection=5000.0,
-        right_air_temperature_k=300.0,
-        right_radiation=False,
-        right_surround_k=300.0,
-        lateral_flux=False,
-        lateral_convection=500.0,
-        lateral_air_temperature_k=300.0,
-        lateral_radiation=False,
-        lateral_surround_k=273.0,
-        initial_type="DEFAULT",
-        initial_uniform_k=600.0,
+        default_k=300.0,  # Default initial temperature (K)
+        minimum_k=173.0,  # Minimum temperature warning threshold (K)
+        maximum_k=2000.0,  # Maximum temperature warning threshold (K)
+        left_boundary="Temp",  # Imposed temperature at x = 0
+        left_temperature_k=400.0,  # T_left = 400 K
+        left_convection=50.0,  # Inactive left h (kept for UI switching convenience)
+        left_air_temperature_k=500.0,  # Inactive left T_air
+        left_radiation=False,  # Left-end radiation off
+        left_surround_k=330.0,  # Inactive left T_sur
+        right_boundary="HeatFlux",  # Convective boundary at x = L
+        right_temperature_k=350.0,  # Inactive right T_right
+        right_convection=5000.0,  # Right-end convection coefficient h_right = 5000 W/(m²·K)
+        right_air_temperature_k=300.0,  # Right-end ambient air temperature T_air = 300 K
+        right_radiation=False,  # Right-end radiation off
+        right_surround_k=300.0,  # Inactive right T_sur
+        lateral_flux=False,  # Lateral convection off in Case 1 (insulated lateral walls)
+        lateral_convection=500.0,  # Lateral convection coefficient when enabled (W/(m²·K))
+        lateral_air_temperature_k=300.0,  # Lateral ambient air temperature (K)
+        lateral_radiation=False,  # Lateral radiation off
+        lateral_surround_k=273.0,  # Lateral radiative surroundings temperature (K)
+        initial_type="DEFAULT",  # Uniform `default_k` initialization
+        initial_uniform_k=600.0,  # Uniform DEFCELL value if switched to DEFCELL
         initial_cells=[
             {"cell": 9, "value_k": 2000.0},
             {"cell": 10, "value_k": 2000.0},
         ],
     )
+    # Default graph selections: cells 1, 10, 20 and time percentages 0, 10, 20, 50, 80, 100%.
     cfg["graphs"] = {
         "cells": [1, 10, 20],
         "percentages": [0, 10, 20, 50, 80, 100],
     }
+    # Return the baseline configuration dictionary.
     return cfg
 
 
 def _build_cases() -> dict[str, SavedCase]:
+    """Construct the ordered dictionary of all 14 pre-programmed teaching cases."""
+    # List to accumulate `SavedCase` instances in order `Case 1` .. `Case 14`.
     cases: list[SavedCase] = []
 
-    # Case 1
+    # Case 1: 1D conduction with convective right end
     c1 = _lecture_base_config()
     cases.append(
         SavedCase(
@@ -119,7 +157,7 @@ def _build_cases() -> dict[str, SavedCase]:
         )
     )
 
-    # Case 2
+    # Case 2: Symmetric convective cooling of hot slab
     c2 = _lecture_base_config()
     c2["controls"].update(duration_s=200.0, time_step_s=0.5, output_interval_s=5.0)
     c2["temperature"].update(
@@ -144,7 +182,7 @@ def _build_cases() -> dict[str, SavedCase]:
         )
     )
 
-    # Case 3
+    # Case 3: Fully insulated bar with central hot spot
     c3 = _lecture_base_config()
     c3["controls"].update(duration_s=150.0, time_step_s=0.3, output_interval_s=3.0)
     c3["temperature"].update(
@@ -170,7 +208,7 @@ def _build_cases() -> dict[str, SavedCase]:
         )
     )
 
-    # Case 4
+    # Case 4: Two-layer composite bar
     c4 = _lecture_base_config()
     c4["controls"].update(duration_s=150.0, time_step_s=0.3, output_interval_s=3.0)
     c4["domains"] = [
@@ -203,7 +241,7 @@ def _build_cases() -> dict[str, SavedCase]:
         )
     )
 
-    # Case 5
+    # Case 5: Two-layer bar with local contact resistance
     c5 = copy.deepcopy(c4)
     c5["controls"].update(duration_s=600.0, time_step_s=0.3, output_interval_s=10.0)
     c5["domains"][1]["resistances"] = [{"distance_mm": 25.0, "value": 0.0001}]
@@ -219,7 +257,7 @@ def _build_cases() -> dict[str, SavedCase]:
         )
     )
 
-    # Case 6
+    # Case 6: Conventional convective fin
     c6 = _lecture_base_config()
     c6["controls"].update(duration_s=100.0, time_step_s=0.3, output_interval_s=2.0)
     c6["temperature"].update(
@@ -246,7 +284,7 @@ def _build_cases() -> dict[str, SavedCase]:
         )
     )
 
-    # Case 7: Fully insulated system with initial temperature gradient and local resistance
+    # Case 7: Fully insulated bar with initial temperature gradient and local resistance
     s14 = _lecture_base_config()
     s14["controls"].update(duration_s=150.0, time_step_s=0.5, output_interval_s=3.0)
     s14["domains"] = [
@@ -280,7 +318,7 @@ def _build_cases() -> dict[str, SavedCase]:
         )
     )
 
-    # Case 8: Two layers separated by a gas gap with radiation
+    # Case 8: Two-layer system separated by a gas gap with radiation
     s15 = _lecture_base_config()
     s15["controls"].update(duration_s=300.0, time_step_s=1.0, output_interval_s=10.0)
     s15["domains"] = [
@@ -318,7 +356,7 @@ def _build_cases() -> dict[str, SavedCase]:
         )
     )
 
-    # Case 9: Two domains, one with internal heat generation and one without
+    # Case 9: Two-domain system with internal heat generation in Section 1
     s16 = _lecture_base_config()
     s16["controls"].update(duration_s=400.0, time_step_s=1.0, output_interval_s=10.0)
     s16["domains"] = [
@@ -351,7 +389,7 @@ def _build_cases() -> dict[str, SavedCase]:
         )
     )
 
-    # Case 10: Rectangular fin insulated at the top
+    # Case 10: Rectangular fin insulated at the tip
     s17a = _lecture_base_config()
     s17a["controls"].update(duration_s=300.0, time_step_s=1.0, output_interval_s=10.0)
     s17a["domains"] = [_lecture_base_section(length_mm=100.0, n_cells=20, conductivity=300.0)]
@@ -376,7 +414,7 @@ def _build_cases() -> dict[str, SavedCase]:
         )
     )
 
-    # Case 11: Circular (cylindrical) fin with same cross section as rectangular (A = 3000 mm²)
+    # Case 11: Cylindrical fin with the same cross-sectional area (A_c = 3000 mm²) as the rectangular fin
     s17b = copy.deepcopy(s17a)
     equiv_diameter_mm = round(math.sqrt(4.0 * 300.0 * 10.0 / math.pi), 6)
     s17b["geometry"].update(
@@ -397,7 +435,7 @@ def _build_cases() -> dict[str, SavedCase]:
         )
     )
 
-    # Case 12: Rectangular fin with lateral radiation and convective tip
+    # Case 12: Rectangular fin with tip convection and lateral radiation
     s17c = copy.deepcopy(s17a)
     s17c["temperature"].update(
         left_temperature_k=500.0,
@@ -419,7 +457,7 @@ def _build_cases() -> dict[str, SavedCase]:
         )
     )
 
-    # Case 13: Pyramidal fin
+    # Case 13: Tapered pyramidal fin
     s17d = copy.deepcopy(s17a)
     s17d["geometry"].update(
         shape="Pyramidal",
@@ -446,7 +484,7 @@ def _build_cases() -> dict[str, SavedCase]:
         )
     )
 
-    # Case 14: Conical fin
+    # Case 14: Tapered conical fin
     s17e = copy.deepcopy(s17a)
     s17e["geometry"].update(
         shape="Conical",
@@ -471,19 +509,24 @@ def _build_cases() -> dict[str, SavedCase]:
         )
     )
 
+    # Return a dictionary mapping each case's display name to its `SavedCase` object.
     return {case.name: case for case in cases}
 
 
+# Global catalog of all 14 pre-programmed teaching cases.
 SAVED_CASES: dict[str, SavedCase] = _build_cases()
 
 
 def get_saved_case_names() -> list[str]:
-    """Return the ordered list of saved lecture case names."""
+    """Return the ordered list of display names (`Case 1` .. `Case 14`) for the UI dropdown."""
+    # Return the keys of `SAVED_CASES` in insertion order.
     return list(SAVED_CASES.keys())
 
 
 def load_saved_case(name: str) -> dict[str, Any]:
-    """Return a deep copy of the internal numerical config for ``name``."""
+    """Return an independent deep copy of the configuration dictionary for `name`."""
+    # Verify that `name` exists in `SAVED_CASES`.
     if name not in SAVED_CASES:
         raise KeyError(f"Unknown saved case: {name}")
+    # Return a deep copy so editing widgets in the UI never modifies the stored template.
     return copy.deepcopy(SAVED_CASES[name].config)
