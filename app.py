@@ -28,6 +28,7 @@ from pathlib import Path  # Cross-platform filesystem path handling
 import pandas as pd  # Used to build editable tables (`st.data_editor`) and CSV exports
 import plotly.graph_objects as go  # Used to build interactive 2D line charts (`go.Figure`, `go.Scatter`)
 import streamlit as st  # Streamlit web UI framework
+import streamlit.components.v1 as components  # Used to keep rotated 3D camera angles locked during Plotly animation
 
 from finmodel.animation import build_3d_fin_figure  # 3D animated fin mesh builder
 from finmodel.empty_inputs import blank_section, empty_numerical_config, prepare_numerical_config  # Form validation
@@ -212,9 +213,15 @@ def numerical_input_form(config: dict) -> tuple[dict, str, int | None]:
                 with b:
                     domain["gas_gap"] = st.checkbox("Gas gap", value=bool(domain["gas_gap"]), key=numerical_key(f"{k}_gas"))
                 with d:
-                    domain["n_cells"] = integer("Cells", domain["n_cells"], key=f"{k}_cells")
+                    if domain["gas_gap"]:
+                        # Gas gaps always use 1 control volume, so lock the displayed count to 1.
+                        domain["n_cells"] = 1
+                        st.number_input("Cells", value=1, disabled=True, key=numerical_key(f"{k}_cells_fixed"))
+                    else:
+                        domain["n_cells"] = integer("Cells", domain["n_cells"], key=f"{k}_cells")
                 with e:
-                    st.caption("Gas gaps use one cell, as in Excel.")
+                    if domain["gas_gap"]:
+                        st.caption("Gas gaps always use 1 cell.")
                 # Row 2: Conductivity k (W/m·K), specific heat c_p (J/kg·K), density ρ (kg/m³), and heat generation q̇_gen (W/m³).
                 a, b, d, e = st.columns(4)
                 with a:
@@ -241,17 +248,18 @@ def numerical_input_form(config: dict) -> tuple[dict, str, int | None]:
                     domain["right_emissivity"] = numeric("Right emissivity", domain["right_emissivity"], key=f"{k}_right_e")
                 with b:
                     domain["right_absorptivity"] = numeric("Right absorptivity", domain["right_absorptivity"], key=f"{k}_right_a")
-                # Row 5: Gas-gap bounding wall emissivities and absorptivities (used when `gas_gap` is checked).
-                st.markdown("Gas gap face properties (used when Gas gap is checked)")
-                a, b, d, e = st.columns(4)
-                with a:
-                    domain["gas_face_emissivity_left"] = numeric("Left face emissivity", domain["gas_face_emissivity_left"], key=f"{k}_gfel")
-                with b:
-                    domain["gas_face_emissivity_right"] = numeric("Right face emissivity", domain["gas_face_emissivity_right"], key=f"{k}_gfer")
-                with d:
-                    domain["gas_face_absorptivity_left"] = numeric("Left face absorptivity", domain["gas_face_absorptivity_left"], key=f"{k}_gfal")
-                with e:
-                    domain["gas_face_absorptivity_right"] = numeric("Right face absorptivity", domain["gas_face_absorptivity_right"], key=f"{k}_gfar")
+                if domain["gas_gap"]:
+                    # Row 5: Gas-gap bounding wall emissivities and absorptivities (shown only when `gas_gap` is checked).
+                    st.markdown("Gas gap face properties")
+                    a, b, d, e = st.columns(4)
+                    with a:
+                        domain["gas_face_emissivity_left"] = numeric("Left face emissivity", domain["gas_face_emissivity_left"], key=f"{k}_gfel")
+                    with b:
+                        domain["gas_face_emissivity_right"] = numeric("Right face emissivity", domain["gas_face_emissivity_right"], key=f"{k}_gfer")
+                    with d:
+                        domain["gas_face_absorptivity_left"] = numeric("Left face absorptivity", domain["gas_face_absorptivity_left"], key=f"{k}_gfal")
+                    with e:
+                        domain["gas_face_absorptivity_right"] = numeric("Right face absorptivity", domain["gas_face_absorptivity_right"], key=f"{k}_gfar")
                 # Row 6: Dynamic table editor for local thermal contact resistances inside this section.
                 st.markdown("Local thermal resistances")
                 domain["resistances"] = series_editor(
@@ -338,13 +346,13 @@ def numerical_input_form(config: dict) -> tuple[dict, str, int | None]:
         graph = updated["graphs"]
         cells_text = st.text_input("Time series at cells (comma separated)", value=", ".join(map(str, graph["cells"])), key=numerical_key("graph_cells"))
         percent_text = st.text_input("Longitudinal profiles at percentages (comma separated)", value=", ".join(map(str, graph["percentages"])), key=numerical_key("graph_percent"))
-        preset_clicked = st.button("Use Excel graph defaults", key=numerical_key("graph_defaults"), help="Select the cells and profile percentages in the supplied Excel workbook.")
+        preset_clicked = st.button("Use default graph selections", key=numerical_key("graph_defaults"), help="Populate default cell indices and time percentages for the output plots.")
         run_clicked = st.button("Run numerical simulation", type="primary")
 
     # Determine which button action (if any) triggered this script rerun.
     action = "run" if run_clicked else "add" if add_clicked else "remove" if remove_clicked else "defaults" if preset_clicked else ""
     if action == "defaults":
-        # Populate the standard Excel workbook graph selections.
+        # Populate standard default graph selections.
         graph["cells"] = [1, 5, 10]
         graph["percentages"] = [0, 10, 20, 50, 80, 100]
     else:
@@ -429,6 +437,96 @@ def numerical_results(config: dict, result: SimulationResult) -> None:
         st.caption("Rotate the fin with the mouse. Use Play, Pause, or the time slider to inspect each printed temperature state.")
         try:
             st.plotly_chart(build_3d_fin_figure(result, config), width="stretch", key="fin_3d")
+            # Plotly GL3D mouse rotation updates `scene._scene.getCamera()` without writing back to
+            # `gd.layout.scene.camera`. Sync it right before Play or slider interactions so animation
+            # stays locked at the user's last rotated camera angle instead of snapping back to default.
+            components.html(
+                """
+                <script>
+                (() => {
+                  const doc = window.parent.document;
+                  const captureUserCam = (gd, sc) => {
+                    const cam = sc && typeof sc.getCamera === 'function' ? sc.getCamera() : null;
+                    if (!cam || !cam.eye) return null;
+                    // Guard against Plotly's turntable gimbal collapse (~0, 0, r).
+                    if (Math.hypot(cam.eye.x || 0, cam.eye.y || 0) < 1e-4) return gd.__finUserCam || null;
+                    gd.__finUserCam = {
+                      eye: { ...cam.eye },
+                      center: { ...cam.center },
+                      up: { ...cam.up },
+                    };
+                    return gd.__finUserCam;
+                  };
+                  const lockSceneCamera = (keep) => {
+                    doc.querySelectorAll('.js-plotly-plot').forEach((gd) => {
+                      const hasMesh3d = Array.isArray(gd.data) && gd.data.some((tr) => tr.type === 'mesh3d');
+                      const scene = gd._fullLayout && gd._fullLayout.scene;
+                      const sc = scene && scene._scene;
+                      if (!hasMesh3d || !sc) return;
+                      if (!sc.__finCameraWrapped && sc.camera) {
+                        sc.__finCameraWrapped = true;
+                        const origInit = sc.initializeGLCamera.bind(sc);
+                        sc.initializeGLCamera = function() {
+                          if (this.__finKeepCam && this.camera) return;
+                          return origInit();
+                        };
+                        const origSetViewport = sc.setViewport.bind(sc);
+                        sc.setViewport = function(sceneLayout) {
+                          if (this.__finKeepCam && gd.__finUserCam && sceneLayout) {
+                            const proj = sceneLayout.camera && sceneLayout.camera.projection
+                              ? sceneLayout.camera.projection
+                              : { type: 'perspective' };
+                            sceneLayout = { ...sceneLayout, camera: { ...gd.__finUserCam, projection: proj } };
+                            if (gd.layout && gd.layout.scene) {
+                              gd.layout.scene.camera = { ...gd.__finUserCam };
+                            }
+                          }
+                          return origSetViewport(sceneLayout);
+                        };
+                      }
+                      if (keep) {
+                        const saved = captureUserCam(gd, sc);
+                        sc.__finKeepCam = true;
+                        if (saved && gd.layout && gd.layout.scene) {
+                          gd.layout.scene.camera = { ...saved };
+                        }
+                      } else {
+                        sc.__finKeepCam = false;
+                      }
+                    });
+                  };
+                  if (!doc.__fin3dCameraSyncInstalled) {
+                    doc.__fin3dCameraSyncInstalled = true;
+                    // Track the user's rotated camera after drags/scrolls, lock before Play/slider, and unlock on canvas or modebar clicks.
+                    ['pointerdown', 'touchstart'].forEach((ev) => {
+                      doc.addEventListener(ev, (e) => {
+                        const target = e.target;
+                        if (!target) return;
+                        if (target.closest('.updatemenu-button, .slider-container, .slider-group')) {
+                          lockSceneCamera(true);
+                        } else if (target.closest('.gl-container, .modebar-btn')) {
+                          lockSceneCamera(false);
+                        }
+                      }, true);
+                    });
+                    ['pointerup', 'wheel'].forEach((ev) => {
+                      doc.addEventListener(ev, (e) => {
+                        if (e.target && e.target.closest('.gl-container')) {
+                          setTimeout(() => {
+                            doc.querySelectorAll('.js-plotly-plot').forEach((gd) => {
+                              const sc = gd._fullLayout && gd._fullLayout.scene && gd._fullLayout.scene._scene;
+                              if (sc && !sc.__finKeepCam) captureUserCam(gd, sc);
+                            });
+                          }, 40);
+                        }
+                      }, true);
+                    });
+                  }
+                })();
+                </script>
+                """,
+                height=0,
+            )
         except ValueError as exc:
             st.warning(f"3D view unavailable: {exc}")
     # Build the `temperature`, `flux`, and `grid` pandas DataFrames for the Tables and Export tabs.

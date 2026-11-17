@@ -296,7 +296,8 @@ def build_3d_fin_figure(result: SimulationResult, config: Mapping[str, Any]) -> 
             **scene_ranges,  # Fixed X, Y, Z axis ranges and titles
             aspectmode="manual",  # Use our readable 3D aspect ratio
             aspectratio=aspect_ratio,
-            camera=dict(eye=dict(x=1.3, y=1.5, z=0.85)),  # Isometric-like initial camera angle
+            # Place the camera at negative y (slightly biased toward negative x) so x = 0 ("Left end") appears on the left.
+            camera=dict(eye=dict(x=-0.45, y=-2.42, z=0.95)),  # Left-to-right initial camera angle
             uirevision=f"fin-3d-{n}-{min(x):g}-{max(x):g}-{y_span:g}-{z_span:g}",  # Preserve user camera rotation across slider moves
         ),
         annotations=[dict(
