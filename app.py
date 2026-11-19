@@ -31,6 +31,7 @@ import streamlit as st  # Streamlit web UI framework
 import streamlit.components.v1 as components  # Used to keep rotated 3D camera angles locked during Plotly animation
 
 from finmodel.animation import build_3d_fin_figure  # 3D animated fin mesh builder
+from finmodel.animation_download import gif_download_html  # Browser-side GIF export
 from finmodel.empty_inputs import blank_section, empty_numerical_config, prepare_numerical_config  # Form validation
 from finmodel.numerical import SimulationResult, simulate  # Core 1D numerical + analytical solver
 from finmodel.presets import export_numerical_preset, import_numerical_preset  # JSON preset converters
@@ -563,6 +564,7 @@ def numerical_results(config: dict, result: SimulationResult) -> None:
                 """,
                 height=0,
             )
+            components.html(gif_download_html(), height=78)
         except ValueError as exc:
             st.warning(f"3D view unavailable: {exc}")
     # Build the `temperature`, `flux`, and `grid` pandas DataFrames for the Tables and Export tabs.
