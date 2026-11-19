@@ -108,6 +108,10 @@ def _axis_bounds(values: list[float | None]) -> tuple[float, float]:
     # Find the minimum and maximum plotted values across all curves on this chart.
     low = min(numeric)
     high = max(numeric)
+    # An unstable explicit run can reach finite values close to the float limit.
+    # Skip "nice" tick arithmetic at this scale to avoid overflowing the axes.
+    if max(abs(low), abs(high)) >= 1e300:
+        return (low, high) if low != high else (min(0.0, low), max(0.0, high))
     # Total vertical data span.
     span = high - low
     # If all plotted values are identical (`span == 0`), pad symmetrically by ±10% of `|low|` (or ±1.0).

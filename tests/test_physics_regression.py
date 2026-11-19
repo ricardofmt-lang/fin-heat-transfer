@@ -1,5 +1,6 @@
 """Independent checks for the student-facing fin model."""
 
+from math import isfinite
 from pathlib import Path
 
 import pytest
@@ -68,13 +69,51 @@ def test_insulated_generation_has_no_steady_reference():
     assert all(row[0] == row[-1] == 0 for row in result.cross_section_heat_flux_w)
 
 
-def test_explicit_error_identifies_fixed_end_even_below_fourier_half():
+def test_explicit_warns_at_fixed_end_even_below_fourier_half():
     cfg = case(1)
-    cfg["controls"].update(method="exp", time_step_s=0.08)
+    cfg["controls"].update(method="exp", time_step_s=0.08, duration_s=0.24)
     alpha = 300 / (3000 * 3000)
     assert alpha * 0.08 / (0.05 / 20) ** 2 < 0.5
-    with pytest.raises(ValueError, match=r"t=0.08 s.*cell 1.*b = 1.28"):
-        simulate(cfg)
+    result = simulate(cfg)
+    assert "t=0.08 s, cell 1: loss coefficient b = 1.28" in result.warnings[0]
+    assert result.times_s == pytest.approx([0, 0.08, 0.16, 0.24])
+    assert result.temperature_k[1][0] > result.temperature_k[2][0]
+    assert result.temperature_k[3][0] > result.temperature_k[2][0]
+
+
+def test_unstable_explicit_run_preserves_finite_results_after_overflow():
+    cfg = case(1)
+    cfg["controls"].update(method="exp", time_step_s=1, duration_s=400, output_interval_s=1)
+    result = simulate(cfg)
+    assert 2 < result.final_computed_time_s < 400
+    assert result.times_s[-1] == result.final_computed_time_s
+    assert result.times_s[1:] == result.heat_flux_times_s
+    assert result.temperature_k[2][0] < 0
+    assert result.temperature_k[3][0] > 0
+    assert any("nonphysical" in warning for warning in result.warnings)
+    assert any("explicit run stopped" in warning for warning in result.warnings)
+    for rows in (result.temperature_k, result.cross_section_heat_flux_w):
+        assert all(isfinite(value) for row in rows for value in row)
+    specs = build_chart_specs(result, cfg["graphs"])
+    assert specs and all(isfinite(s.y_min) and isfinite(s.y_max) for s in specs)
+
+
+def test_app_shows_consecutive_steps_even_with_a_coarse_output_interval():
+    app = AppTest.from_file(str(APP)).run()
+    app.selectbox(key="saved_case").select(get_saved_case_names()[0]).run()
+    next(w for w in app.selectbox if w.label == "Time discretisation").select("exp").run()
+    next(w for w in app.number_input if w.label == "Time step (s)").set_value(0.1).run()
+    next(w for w in app.number_input if w.label == "Duration (s)").set_value(0.4).run()
+    # Case 1's output interval is 2 s, longer than this entire run.
+    next(b for b in app.button if b.label == "Run numerical simulation").click().run(timeout=30)
+    assert not app.exception and not app.error
+    assert any("Explicit stability warning" in warning.value for warning in app.warning)
+    result = app.session_state["fin_result"]
+    assert max(result.grid.fourier_number) > 0.5
+    assert result.times_s == pytest.approx([0, 0.1, 0.2, 0.3, 0.4])
+    charts = app.get("plotly_chart")
+    preview = next(chart for chart in charts if "Early explicit steps at cell 1" in chart.proto.spec)
+    assert preview is not None
 
 
 def test_radiating_end_reports_irradiation_linear_in_absorptivity():

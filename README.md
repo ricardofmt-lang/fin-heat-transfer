@@ -8,7 +8,7 @@ Interactive Streamlit application for 1D transient and steady-state heat transfe
 - **JSON Import & CSV/JSON Export**: Save or load full simulation configurations as JSON and export temperature, heat-flux, and grid tables as CSV.
 - **Interactive 2D & 3D Visualization**: Select temperature histories at cell centres, heat rates at faces, and profiles at saved times. The interactive 3D fin uses a fixed temperature scale and one frame per saved time.
 
-The solver retains the fixed-step Excel output schedule. Results show the requested duration, final computed time and last saved time separately. Explicit checks the assembled loss weight of each cell, including its boundaries and active heat losses.
+The solver retains the fixed-step Excel output schedule. Results show the requested duration, final computed time and last saved time separately. Explicit checks the assembled loss weight of each cell, including its boundaries and active heat losses. It warns when that weight exceeds the limit, continues for demonstration, and saves consecutive steps around the warning for a separate graph. If the run overflows, it keeps the results saved so far.
 
 ## Run Locally
 

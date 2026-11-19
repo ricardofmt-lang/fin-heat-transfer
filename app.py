@@ -430,6 +430,15 @@ def numerical_results(config: dict, result: SimulationResult) -> None:
         from finmodel.visualization import build_chart_specs
 
         st.caption(result.analytical_note)
+        if result.explicit_warning_cell is not None and len(result.explicit_preview_rows) >= 2:
+            cell = result.explicit_warning_cell
+            rows = result.explicit_preview_rows
+            st.caption("These consecutive steps show the onset of possible instability, separately from the full run's scale.")
+            _plot(
+                f"Early explicit steps at cell {cell}", "Time (s)", "Temperature (K)",
+                [(f"Cell {cell}", [result.times_s[i] for i in rows], [result.temperature_k[i][cell - 1] for i in rows])],
+                key="explicit_stability_preview",
+            )
         try:
             specs = build_chart_specs(result, config["graphs"])
         except ValueError as exc:
@@ -461,6 +470,8 @@ def numerical_results(config: dict, result: SimulationResult) -> None:
         # Render the rotatable 3D fin mesh with Play/Pause buttons and time slider.
         st.caption("Rotate the fin with the mouse. Use Play, Pause, or the time slider to inspect each printed temperature state.")
         try:
+            if result.explicit_warning_cell is not None:
+                raise ValueError("Use Graphs to inspect the explicit stability demonstration.")
             st.plotly_chart(build_3d_fin_figure(result, config), width="stretch", key="fin_3d")
             # Plotly GL3D mouse rotation updates `scene._scene.getCamera()` without writing back to
             # `gd.layout.scene.camera`. Sync it right before Play or slider interactions so animation

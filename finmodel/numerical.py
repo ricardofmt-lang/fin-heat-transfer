@@ -22,8 +22,8 @@ capacity $c_{p,i}$, conservation of energy over a time step $\\Delta t$ states:
 2. **Time Discretisation (`exp` vs. `imp`)**:
    - **Explicit (`exp`, Forward Euler)**: Evaluates spatial conduction and
      convection fluxes at the known time level $T^{\\text{old}}$. Simple direct
-     update. The assembled loss coefficient must leave a nonnegative weight
-     on each cell's old temperature; the interior Fourier number is only a guide.
+     update. A negative weight on a cell's old temperature can cause
+     oscillations. Report it and retain example steps for teaching.
    - **Implicit (`imp`, Backward Euler)**: Evaluates linear conduction and
      convection fluxes at the unknown new time level $T^{\\text{new}}$, yielding
      a tridiagonal system of linear equations solved in $O(N)$ operations via
@@ -106,11 +106,13 @@ class SimulationResult:
     heat_flux_times_s: list[float]  # Printed times (s) for heat flux (excludes t = 0.0): shape (len(times_s) - 1,)
     cross_section_heat_flux_w: list[list[float]]  # Face heat rates (W) at each printed time > 0: shape (len(times_s) - 1, n + 1)
     grid: Grid  # The finite-volume mesh and property arrays used for the simulation
-    warnings: list[str] = field(default_factory=list)  # Advisory warnings if temperatures cross minimum_k or maximum_k
+    warnings: list[str] = field(default_factory=list)
     analytical_temperature_k: list[float] = field(default_factory=list)  # 1D steady-state analytical temperatures (K) at cells 1..n
     analytical_heat_flux_w: list[float] = field(default_factory=list)  # 1D steady-state analytical heat fluxes (W) at faces 1..n+1
     final_computed_time_s: float | None = None  # May differ from the last printed time.
     analytical_note: str = ""
+    explicit_preview_rows: list[int] = field(default_factory=list)  # Saved row indices around the first explicit warning.
+    explicit_warning_cell: int | None = None
 
     @property
     def cell_centers_m(self) -> list[float]:
@@ -728,8 +730,8 @@ def _transport_coefficients(
     return left, center, right, known
 
 
-def _step(config: dict[str, Any], gr: Grid, old: list[float]) -> list[float]:
-    """Advance the cell temperature vector `old` ($T^m$) by one time step $\\Delta t$ to produce `result` ($T^{m+1}$)."""
+def _step(config: dict[str, Any], gr: Grid, old: list[float]) -> tuple[list[float], tuple[int, float] | None]:
+    """Advance one step; report the first explicit cell with a negative old-temperature weight."""
     # Compute the finite-volume transport coefficients at the current time step.
     left, center, right, known = _transport_coefficients(config, gr, old)
     # Number of cells N and output temperature vector `result` (1-based, indices 1..n).
@@ -737,22 +739,19 @@ def _step(config: dict[str, Any], gr: Grid, old: list[float]) -> list[float]:
     result = _zeros(n)
     # Check whether the user selected Explicit (`exp`) or Implicit (`imp`) time integration.
     method = config["controls"]["method"].lower()
+    unstable_cell = None
     if method == "exp":
         # Explicit Forward-Euler scheme:
         # T_i^{m+1} = known_i + left_i * T_{i-1}^m + (1 - center_i) * T_i^m + right_i * T_{i+1}^m
         for i in range(1, n + 1):
             if not math.isfinite(center[i]):
-                raise ValueError(f"Explicit loss coefficient is not finite at cell {i}. Reduce the time step and check inputs.")
-            if center[i] > 1.0 + 1e-12:
-                limit = config["controls"]["time_step_s"] / center[i]
-                raise ValueError(
-                    f"Explicit time step is too large at cell {i}: the loss coefficient b = {center[i]:.6g} "
-                    f"exceeds 1. Try a time step below {limit:.6g} s or use Implicit."
-                )
+                raise ArithmeticError(f"the explicit loss coefficient is not finite at cell {i}")
+            if unstable_cell is None and center[i] > 1.0 + 1e-12:
+                unstable_cell = (i, center[i])
             # Diagonal weight in the explicit update is `1 - center[i]`.
             center[i] = 1 - center[i]
         if n == 1:
-            return [0.0, known[1] + center[1] * old[1]]
+            return [0.0, known[1] + center[1] * old[1]], unstable_cell
         # Update cell 1 (left boundary cell; `left[1]` is already incorporated into `known[1]`).
         result[1] = known[1] + center[1] * old[1] + right[1] * old[2]
         # Update interior cells i = 2..n-1.
@@ -791,7 +790,7 @@ def _step(config: dict[str, Any], gr: Grid, old: list[float]) -> list[float]:
             # Solve for T_i^{m+1} = (D_i - C_i * T_{i+1}^{m+1}) / B_i.
             result[i] = (known[i] - right[i] * result[i + 1]) / center[i]
     # Return the new 1-based cell temperature vector T^{m+1}.
-    return result
+    return result, unstable_cell
 
 
 def _heat_flux(config: dict[str, Any], gr: Grid, new: list[float], old: list[float]) -> list[float]:
@@ -887,6 +886,12 @@ def simulate(config: dict[str, Any]) -> SimulationResult:
     print_time = float(controls["output_interval_s"])
     dt = float(controls["time_step_s"])
     duration = float(controls["duration_s"])
+    explicit = controls["method"].lower() == "exp"
+    warnings: list[str] = []
+    warning_cell = None
+    nonphysical_warning = False
+    preview_rows: list[int] = []
+    preview_remaining = 0
     # 2. Main time-marching loop: advance by `dt` until `time >= duration`.
     for cell, value in enumerate(temperatures[0], 1):
         if not math.isfinite(value) or value <= 0:
@@ -895,47 +900,67 @@ def simulate(config: dict[str, Any]) -> SimulationResult:
     observed_max = max(temperatures[0])
     while time < duration:
         # Advance the simulation clock by one time step Δt.
-        if time + dt <= time or not math.isfinite(time + dt):
+        next_time = time + dt
+        if next_time <= time or not math.isfinite(next_time):
             raise ValueError("The time step cannot advance the simulation clock. Check duration and time step.")
-        time += dt
-        # Save the previous time step's temperatures in `old`.
-        old = new.copy()
-        # Compute the new cell temperatures at `time`.
+        old = new
+        scheduled = next_time >= print_time
+        stage = "temperature update"
         try:
-            new = _step(config, gr, old)
-        except (OverflowError, ZeroDivisionError) as exc:
-            raise ValueError(f"Temperature update failed at t={time:.9g} s. Check the inputs and reduce the time step.") from exc
-        except ValueError as exc:
-            raise ValueError(f"At t={time:.9g} s: {exc}") from exc
-        for cell in range(1, n + 1):
-            value = new[cell]
-            if not math.isfinite(value) or value <= 0:
-                raise ValueError(
-                    f"Cell {cell} reached {value:.6g} K at t={time:.9g} s. "
-                    "Check temperatures and sources, or reduce the time step."
+            new, unstable_cell = _step(config, gr, old)
+            if unstable_cell is not None and warning_cell is None:
+                cell, b = unstable_cell
+                warning_cell = cell
+                warnings.append(
+                    f"Explicit stability warning at t={next_time:.9g} s, cell {cell}: "
+                    f"loss coefficient b = {b:.6g} exceeds 1. The run continues to show possible "
+                    f"oscillations. For a physical solution, try a time step below {dt / b:.6g} s or use Implicit."
                 )
-            observed_min = min(observed_min, value)
-            observed_max = max(observed_max, value)
-        # Whenever `time` reaches or passes the next scheduled output time `print_time`, record the state.
-        if time >= print_time:
-            # Evaluate cross-sectional heat fluxes across all n + 1 faces.
-            try:
+                # Keep consecutive steps even if the scheduled output is too coarse
+                # to reveal the oscillations. Leave the normal output clock alone.
+                preview_remaining = 8
+                if times[-1] == time:
+                    preview_rows.append(len(times) - 1)
+            for cell in range(1, n + 1):
+                value = new[cell]
+                if not math.isfinite(value):
+                    raise ArithmeticError(f"temperature at cell {cell} is not finite")
+                if value <= 0:
+                    message = f"Cell {cell} reached {value:.6g} K at t={next_time:.9g} s."
+                    if not explicit:
+                        raise ValueError(f"{message} Check temperatures and sources, or reduce the time step.")
+                    if not nonphysical_warning:
+                        warnings.append(f"{message} Values at or below 0 K are nonphysical and are shown for diagnosis.")
+                        nonphysical_warning = True
+            capture = preview_remaining > 0
+            if scheduled or capture:
+                stage = "face heat rate"
                 flux = _heat_flux(config, gr, new, old)
-            except (OverflowError, ZeroDivisionError) as exc:
-                raise ValueError(f"Face heat rate could not be computed at t={time:.9g} s. Check temperature and geometry inputs.") from exc
-            for face in range(1, n + 2):
-                if not math.isfinite(flux[face]):
-                    raise ValueError(f"Heat rate at face {face} is not finite at t={time:.9g} s.")
-            # Append the current time and 0-based temperature/flux slices to the printed history.
+                for face in range(1, n + 2):
+                    if not math.isfinite(flux[face]):
+                        raise ArithmeticError(f"heat rate at face {face} is not finite")
+        except ArithmeticError as exc:
+            message = f"The {stage} failed at t={next_time:.9g} s: {exc}."
+            if not explicit:
+                raise ValueError(f"{message} Check the inputs and reduce the time step.") from exc
+            warnings.append(f"{message} The explicit run stopped; the graphs show the preceding saved results.")
+            break
+
+        time = next_time
+        observed_min = min(observed_min, min(new[1:]))
+        observed_max = max(observed_max, max(new[1:]))
+        if scheduled or capture:
+            if capture:
+                preview_rows.append(len(times))
+                preview_remaining -= 1
             times.append(time)
-            temperatures.append(new[1 : n + 1].copy())
+            temperatures.append(new[1 : n + 1])
             flux_times.append(time)
             fluxes.append(flux[1 : n + 2])
-            # Schedule the next output print time by adding `output_interval_s`.
+        if scheduled:
             print_time += float(controls["output_interval_s"])
 
     # 3. Check the full computed trajectory, including steps between saved rows.
-    warnings: list[str] = []
     min_k = float(tcfg.get("minimum_k") or 0.0)
     max_k = float(tcfg.get("maximum_k") or 0.0)
     if min_k > 0.0 and observed_min < min_k:
@@ -972,4 +997,6 @@ def simulate(config: dict[str, Any]) -> SimulationResult:
         an_fluxes,
         time,
         note,
+        preview_rows,
+        warning_cell,
     )
