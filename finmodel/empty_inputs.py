@@ -314,6 +314,7 @@ def prepare_numerical_config(config: dict[str, Any]) -> dict[str, Any]:
     # Build a dictionary mapping only the currently active temperature/convection keys to their error labels.
     required_temperature = {}
     # `DEFAULT` initialization requires `default_k` (in `CELL` mode, `default_k` is also used for unlisted cells).
+    total_cells = sum(d["n_cells"] for d in domains)
     if initial == "DEFAULT":
         # Require the default temperature (K).
         required_temperature["default_k"] = "default temperature (K)"
@@ -389,11 +390,21 @@ def prepare_numerical_config(config: dict[str, Any]) -> dict[str, Any]:
         # Validate that `cell` is an integer cell index and `value_k` is a finite temperature in kelvin.
         entry["cell"] = _integer(entry.get("cell"), f"initial cell {index} number")
         entry["value_k"] = _number(entry.get("value_k"), f"initial cell {index} temperature (K)", required=True)
+        if initial == "CELL" and not 1 <= entry["cell"] <= total_cells:
+            raise ValueError(f"Initial cell {entry['cell']} is outside 1..{total_cells}.")
+    if initial == "CELL" and len({entry["cell"] for entry in initial_cells}) < total_cells:
+        temperature["default_k"] = _number(
+            config["temperature"].get("default_k"),
+            "default temperature (K) for unlisted cells",
+            required=True,
+        )
     # Save the validated `initial_cells` list back into `temperature`.
     temperature["initial_cells"] = initial_cells
 
     # Validate the graph control lists (`cells` for time-series plots and `percentages` for spatial profiles).
-    for key, label in (("cells", "graph cells"), ("percentages", "graph percentages")):
+    for key, label in (("cells", "graph cells"), ("faces", "graph faces"), ("percentages", "graph percentages")):
+        if key == "faces" and key not in graphs:
+            continue  # Older presets use their cell selection for heat-rate charts too.
         # Retrieve the list of selected cell numbers or percentages.
         values = graphs.get(key, [])
         # Ensure the selection is a list.

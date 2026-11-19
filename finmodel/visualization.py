@@ -174,14 +174,14 @@ def _selected_row(percentage: int, last_row_index: int) -> int:
     return round(percentage / 100 * last_row_index)
 
 
-def _time_label(time_s: float) -> str:
-    """Format a printed time `time_s` (s) as an integer string for chart titles and legends."""
+def _time_label(time_s: float, *, legacy: bool = False) -> str:
+    """Use actual saved seconds, suppressing floating point display noise."""
     # Round `time_s` to the nearest integer second and convert to string.
-    return str(round(time_s))
+    return str(round(time_s)) if legacy else f"{time_s:.12g}"
 
 
 def build_chart_specs(
-    result: SimulationResult, graph_controls: Mapping[str, list[int | float]]
+    result: SimulationResult, graph_controls: Mapping[str, list[int | float]], *, legacy_labels: bool = False
 ) -> list[ChartSpec]:
     """Build the ordered list of `ChartSpec` objects for all selected cells and time percentages."""
     # Extract grid size and printed numerical/analytical arrays from `result`.
@@ -207,7 +207,8 @@ def build_chart_specs(
         raise ValueError("Heat-flux rows must follow the blank initial row and have n+1 faces")
 
     # Validate the user-selected cell indices (`0..n`) and time percentages (`0..100`).
-    cells = _vba_controls(list(graph_controls.get("cells", [])), n, "Cell number")
+    temperature_cells = _vba_controls(list(graph_controls.get("cells", [])), n, "Cell number")
+    flux_faces = _vba_controls(list(graph_controls.get("faces", temperature_cells)), n + 1, "Face number")
     percentages = _vba_controls(list(graph_controls.get("percentages", [])), 100, "Percentage")
     # Map each percentage to its corresponding 0-based row index in `times`.
     selected_rows = [_selected_row(value, len(times) - 1) for value in percentages]
@@ -220,6 +221,8 @@ def build_chart_specs(
     ):
         # Flag indicating whether we are building heat-flux charts (`True`) or temperature charts (`False`).
         is_flux = property_name == "CrossSectionHeatFlux"
+        cells = flux_faces if is_flux else temperature_cells
+        location = "Cell" if not is_flux or legacy_labels else "Face"
         # Whether an analytical comparison profile is available for this property.
         has_analytical = has_an_flux if is_flux else has_an_temp
         # Y-axis label with units (`"Temperature (K)"` or `"CrossSectionHeatFlux (W)"`).
@@ -336,20 +339,20 @@ def build_chart_specs(
         # 1. `overlap_time`: One chart overlaying all selected cell time histories + analytical asymptotes.
         if cells:
             series_list: list[ChartSeries] = [
-                ChartSeries(f" @Cell {cell}", time_x, time_y(cell), cell_number=cell)
+                ChartSeries(f" @{location} {cell}", time_x, time_y(cell), cell_number=cell)
                 for cell in cells
             ]
             if has_analytical:
                 # Append the steady-state analytical reference line for each selected cell.
                 series_list.extend(
-                    ChartSeries(f"Analytical @Cell {cell}", time_x, analytical_time_y(cell), cell_number=cell)
+                    ChartSeries(f"Analytical @{location} {cell}", time_x, analytical_time_y(cell), cell_number=cell)
                     for cell in cells
                 )
             series = tuple(series_list)
             bound_values = [value for s in series for value in s.y_values]
             append(
                 "overlap_time",
-                property_name + " vs time in cell ",
+                property_name + f" vs time in {location.lower()} ",
                 "Seconds",
                 legend,
                 series,
@@ -360,7 +363,7 @@ def build_chart_specs(
         if percentages:
             series_list = [
                 ChartSeries(
-                    " @Time " + _time_label(row_time(selected_rows[i])) + " seconds",
+                    " @Time " + _time_label(row_time(selected_rows[i]), legacy=legacy_labels) + " seconds",
                     spatial_x,
                     space_y(selected_rows[i]),
                     percentage=percentages[i],
@@ -404,7 +407,7 @@ def build_chart_specs(
             series = tuple(indiv_time_series)
             append(
                 "individual_time",
-                property_name + " vs time in cell " + str(cell),
+                property_name + f" vs time in {location.lower()} " + str(cell),
                 "Seconds",
                 legend,
                 series,
@@ -446,7 +449,7 @@ def build_chart_specs(
             )
             append(
                 "individual_space",
-                legend + " vs cell at " + _time_label(selected_time) + " Seconds after start",
+                legend + " vs cell at " + _time_label(selected_time, legacy=legacy_labels) + " Seconds after start",
                 "Distance to Fin´s Base (m)",
                 legend,
                 series,

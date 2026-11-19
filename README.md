@@ -3,15 +3,17 @@
 Interactive Streamlit application for 1D transient and steady-state heat transfer across fins and composite bars.
 
 ## Key Features
-- **Unified Numerical & Analytical Solver**: Simulates 1D transient conduction, convection, internal heat generation, local contact resistances, gas gaps, and surface/lateral radiation using Explicit or Implicit finite-volume schemes (`finmodel/numerical.py`), while automatically computing and overlaying the exact 1D steady-state analytical solution (`finmodel/analytical.py`) on every 2D graph.
+- **Numerical Solver and Steady Reference**: Simulates 1D transient conduction, convection, internal heat generation, contact resistances, gas gaps and radiation with Explicit or Implicit finite volume schemes. The analytical reference uses averaged geometry and material properties and omits radiation. An insulated fin without generation uses its initial energy to determine the equilibrium temperature.
 - **14 Built-in Saved Cases**: Includes 14 ready-to-run physical benchmark cases (`finmodel/saved_cases.py`) accessible from the **Load saved cases** selector at the top of the app.
 - **JSON Import & CSV/JSON Export**: Save or load full simulation configurations as JSON and export temperature, heat-flux, and grid tables as CSV.
-- **Interactive 2D & 3D Visualization**: Generates all 22 temperature and cross-sectional heat-flux graphs (with analytical comparison curves) plus an interactive 3D animated fin surface (`finmodel/animation.py`).
+- **Interactive 2D & 3D Visualization**: Select temperature histories at cell centres, heat rates at faces, and profiles at saved times. The interactive 3D fin uses a fixed temperature scale and one frame per saved time.
+
+The solver retains the fixed-step Excel output schedule. Results show the requested duration, final computed time and last saved time separately. Explicit checks the assembled loss weight of each cell, including its boundaries and active heat losses.
 
 ## Run Locally
 
 ```powershell
-.\run.cmd
+python -m streamlit run app.py
 ```
 
 Or with a fresh virtual environment (Python 3.11+):
@@ -19,7 +21,7 @@ Or with a fresh virtual environment (Python 3.11+):
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\run.cmd
+.\.venv\Scripts\python.exe -m streamlit run app.py
 ```
 
 ## Deploy Online (GitHub + Streamlit Community Cloud)
@@ -31,6 +33,6 @@ python -m venv .venv
 ## Run Tests
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
-.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe -m pip install pytest
+.\.venv\Scripts\python.exe -m pytest -q tests/test_physics_regression.py
 ```

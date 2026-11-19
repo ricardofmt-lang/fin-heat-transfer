@@ -37,7 +37,7 @@ and pure 1D conduction when $h = 0$).
 from __future__ import annotations  # Postpone evaluation of type annotations
 
 from dataclasses import dataclass  # Used to define immutable input/output containers
-from math import cosh, exp, sinh, sqrt  # Hyperbolic, exponential, and square-root functions for exact ODE solutions
+from math import cosh, exp, fsum, isclose, sinh, sqrt
 from pathlib import Path  # Cross-platform filesystem path handling
 from typing import TYPE_CHECKING, Any  # Type annotations
 from xml.etree import ElementTree  # XML parser for reading cached values from `.xlsx` files
@@ -264,8 +264,12 @@ def evaluate_analytical(
     )
 
 
+class NoAnalyticalReference(ValueError):
+    """The simplified steady model cannot provide a meaningful comparison."""
+
+
 def evaluate_analytical_from_numerical(
-    config: dict[str, Any], grid: Grid
+    config: dict[str, Any], grid: Grid, initial_k: list[float] | None = None
 ) -> tuple[list[float], list[float]]:
     """Compute the 1D steady-state analytical temperatures (at cell centers) and
     conductive heat rates (at cell faces) directly from a numerical configuration and grid.
@@ -373,6 +377,41 @@ def evaluate_analytical_from_numerical(
         # Insulated right boundary (`NoHeatFlux` or `HeatFlux` with h_R = 0): q(L) = 0.
         alpha_r, beta_r, gamma_r = 0.0, 1.0, 0.0
 
+    # Insulated ends and sides give a singular boundary system. Use the
+    # energy balance to decide whether a unique, useful reference exists.
+    if not has_lat and alpha_l == alpha_r == 0.0:
+        end_rad = any(
+            tcfg[f"{side}_boundary"] == "HeatFlux"
+            and tcfg.get(f"{side}_radiation")
+            and grid.face_area[face] > 0
+            and (grid.face_emissivity[face] or grid.face_absorptivity[face])
+            for side, face in (("left", 1), ("right", n + 1))
+        )
+        side_rad = tcfg.get("lateral_radiation") and any(
+            grid.lateral_emissivity[i] or grid.lateral_absorptivity[i] for i in range(1, n + 1)
+        )
+        if end_rad or side_rad:
+            raise NoAnalyticalReference("No analytical reference: the fin exchanges heat only by radiation, which the steady comparison omits.")
+        sources = [grid.heat_generated[i] * grid.cell_volume[i] for i in range(1, n + 1)]
+        if not isclose(fsum(sources), 0.0, abs_tol=1e-12 * fsum(map(abs, sources))):
+            raise NoAnalyticalReference("No steady state: the insulated fin has a nonzero net internal heat source.")
+        if any(sources):
+            raise NoAnalyticalReference("No analytical reference: the isolated fin has distributed heating and cooling that the averaged model cannot represent.")
+        if any(grid.gas_gap[i] and (
+            grid.face_emissivity[i] * grid.face_absorptivity[i + 1]
+            != grid.face_absorptivity[i] * grid.face_emissivity[i + 1]
+        ) for i in range(2, n)):
+            raise NoAnalyticalReference("No analytical reference: asymmetric gas gap radiation is omitted from the steady comparison.")
+        if initial_k is None:
+            mode = tcfg.get("initial_type", "DEFAULT")
+            initial_k = [float(tcfg["initial_uniform_k"]) if mode == "DEFCELL" else default_temp] * n
+            if mode == "CELL":
+                for row in tcfg.get("initial_cells", []):
+                    initial_k[int(row["cell"]) - 1] = float(row["value_k"])
+        capacitance = [grid.density[i] * grid.thermal_capacity[i] * grid.cell_volume[i] for i in range(1, n + 1)]
+        equilibrium = fsum(t * c for t, c in zip(initial_k, capacitance, strict=True)) / fsum(capacitance)
+        return [equilibrium] * n, [0.0] * (n + 1)
+
     # Branch 1: Lateral convection is active (h_lat > 0 and P > 0) -> Hyperbolic / exponential fin ODE.
     if h_lat > 0.0 and perimeter > 0.0:
         # Fin parameter m = sqrt((h_lat * P) / (k_eff * A_c)) in m⁻¹.
@@ -417,9 +456,8 @@ def evaluate_analytical_from_numerical(
 
         # Solve the 2x2 linear system by Cramer's rule: det = a11 * a22 - a12 * a21.
         det = a11 * a22 - a12 * a21
-        if abs(det) < 1e-30:
-            # If the system is singular, the homogeneous coefficients are zero (T(x) = T_particular).
-            c1, c2 = 0.0, 0.0
+        if det == 0:
+            raise NoAnalyticalReference("No analytical reference: the steady boundary equations were numerically singular.")
         else:
             # Compute C1 and C2 via Cramer's rule.
             c1 = (rhs1 * a22 - rhs2 * a12) / det
@@ -451,9 +489,8 @@ def evaluate_analytical_from_numerical(
     )
     # Determinant of the 2x2 boundary system.
     det = a11 * a22 - a12 * a21
-    if abs(det) < 1e-30:
-        # When both ends have NoHeatFlux (Neumann-Neumann), T'(x) = 0 and T(x) = default_temp.
-        c1, c2 = default_temp, 0.0
+    if det == 0:
+        raise NoAnalyticalReference("No analytical reference: the steady boundary equations were numerically singular.")
     else:
         # Solve for integration constants C1 (K) and C2 (K/m) via Cramer's rule.
         c1 = (rhs1 * a22 - rhs2 * a12) / det

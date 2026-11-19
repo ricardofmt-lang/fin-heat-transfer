@@ -22,12 +22,13 @@ capacity $c_{p,i}$, conservation of energy over a time step $\\Delta t$ states:
 2. **Time Discretisation (`exp` vs. `imp`)**:
    - **Explicit (`exp`, Forward Euler)**: Evaluates spatial conduction and
      convection fluxes at the known time level $T^{\\text{old}}$. Simple direct
-     update, but conditionally stable (requires mesh Fourier number
-     $\\text{Fo}_i = \\frac{\\alpha_i \\Delta t}{\\Delta x_i^2} \\lesssim \\frac{1}{2}$).
+     update. The assembled loss coefficient must leave a nonnegative weight
+     on each cell's old temperature; the interior Fourier number is only a guide.
    - **Implicit (`imp`, Backward Euler)**: Evaluates linear conduction and
      convection fluxes at the unknown new time level $T^{\\text{new}}$, yielding
      a tridiagonal system of linear equations solved in $O(N)$ operations via
-     the Thomas algorithm (TDMA). Unconditionally stable for arbitrary $\\Delta t$.
+     the Thomas algorithm (TDMA). The linear problem is unconditionally
+     stable, but accuracy and lagged radiation still depend on the step size.
    - **Thermal Radiation**: Because radiative heat transfer scales with $T^4$,
      surface emission is split in semi-implicit form as $\\sigma \\varepsilon (T^{\\text{old}})^3 T^{\\text{new}}$
      while irradiation from the surroundings $\\sigma \\alpha T_{\\text{sur}}^4$ is added
@@ -40,7 +41,7 @@ from dataclasses import dataclass, field  # Used to define structured mesh and s
 import math  # Standard mathematical functions (`pi`, `sqrt`, `isfinite`)
 from typing import Any  # Generic type annotation for configuration dictionaries
 
-from finmodel.analytical import evaluate_analytical_from_numerical  # Automatic 1D steady-state analytical solver
+from finmodel.analytical import NoAnalyticalReference, evaluate_analytical_from_numerical
 
 
 # Stefan-Boltzmann constant σ in W/(m²·K⁴) for thermal radiation calculations.
@@ -108,6 +109,8 @@ class SimulationResult:
     warnings: list[str] = field(default_factory=list)  # Advisory warnings if temperatures cross minimum_k or maximum_k
     analytical_temperature_k: list[float] = field(default_factory=list)  # 1D steady-state analytical temperatures (K) at cells 1..n
     analytical_heat_flux_w: list[float] = field(default_factory=list)  # 1D steady-state analytical heat fluxes (W) at faces 1..n+1
+    final_computed_time_s: float | None = None  # May differ from the last printed time.
+    analytical_note: str = ""
 
     @property
     def cell_centers_m(self) -> list[float]:
@@ -150,6 +153,10 @@ class SimulationResult:
         if self.analytical_heat_flux_w:
             # Attach the 1D analytical heat-flux profile (W).
             payload["analytical_heat_flux_w"] = self.analytical_heat_flux_w
+        if self.final_computed_time_s is not None:
+            payload["final_computed_time_s"] = self.final_computed_time_s
+        if self.analytical_note:
+            payload["analytical_note"] = self.analytical_note
         # Return the complete serializable dictionary.
         return payload
 
@@ -163,7 +170,7 @@ def _validate(config: dict[str, Any]) -> None:
         # Reject unknown time integration methods.
         raise ValueError("TimeDiscretisation must be imp or exp")
     # Verify that total duration, integration time step Δt, and print interval Δt_print are strictly positive.
-    if c["duration_s"] <= 0 or c["time_step_s"] <= 0 or c["output_interval_s"] <= 0:
+    if not all(math.isfinite(c[k]) and c[k] > 0 for k in ("duration_s", "time_step_s", "output_interval_s")):
         # Reject zero or negative timing parameters.
         raise ValueError("Simulation duration, time step, and output interval must be positive")
     # Extract the fin geometry dictionary and shape name.
@@ -202,6 +209,11 @@ def _validate(config: dict[str, Any]) -> None:
         raise ValueError("At least one domain is required")
     # Validate each section's physical properties and local contact resistances.
     for i, d in enumerate(domains, start=1):
+        if d.get("gas_gap", False) and i in (1, len(domains)):
+            raise ValueError(f"Section {i}: a gas gap must be between other sections (one on each side).")
+        for key, value in d.items():
+            if ("emissivity" in key or "absorptivity" in key) and not 0 <= float(value) <= 1:
+                raise ValueError(f"Section {i} {key.replace('_', ' ')} must be between 0 and 1.")
         # Section axial length L_i must be strictly positive.
         if d["length_mm"] <= 0:
             # Reject zero or negative section length.
@@ -237,6 +249,8 @@ def _validate(config: dict[str, Any]) -> None:
             prev_distance = dist
     # Validate boundary condition types and initialization mode in `config["temperature"]`.
     t = config["temperature"]
+    if t.get("lateral_flux") and not float(t["lateral_convection"]) >= 0:
+        raise ValueError("Lateral convection coefficient cannot be negative.")
     for key in ("left_boundary", "right_boundary"):
         # Each end boundary must be Dirichlet (`Temp`), Robin (`HeatFlux`), or homogeneous Neumann (`NoHeatFlux`).
         if t[key] not in {"Temp", "HeatFlux", "NoHeatFlux"}:
@@ -250,6 +264,24 @@ def _validate(config: dict[str, Any]) -> None:
     if t["initial_type"] == "CELL" and not t.get("initial_cells"):
         # Reject empty `initial_cells` when `initial_type == "CELL"`.
         raise ValueError("CELL initialization requires at least one cell temperature")
+    active_temperatures = []
+    for side in ("left", "right"):
+        if t[f"{side}_boundary"] == "Temp":
+            active_temperatures.append(f"{side}_temperature_k")
+        if t[f"{side}_boundary"] == "HeatFlux":
+            if not float(t[f"{side}_convection"]) >= 0:
+                raise ValueError(f"{side.capitalize()} convection coefficient cannot be negative.")
+            if float(t[f"{side}_convection"]) > 0:
+                active_temperatures.append(f"{side}_air_temperature_k")
+            if t[f"{side}_radiation"]:
+                active_temperatures.append(f"{side}_surround_k")
+    if t["lateral_flux"] and float(t["lateral_convection"]) > 0:
+        active_temperatures.append("lateral_air_temperature_k")
+    if t["lateral_radiation"]:
+        active_temperatures.append("lateral_surround_k")
+    for key in active_temperatures:
+        if not math.isfinite(float(t[key])) or float(t[key]) <= 0:
+            raise ValueError(f"{key.removesuffix('_k').replace('_', ' ').capitalize()} must be above 0 K.")
 
 
 def build_grid(config: dict[str, Any]) -> Grid:
@@ -594,10 +626,14 @@ def _transport_coefficients(
         # Temperature increment (K) from internal volumetric heat generation: Δt * q̇_{gen,i} / (ρ_i c_{p,i}).
         known[i] = dt * gr.heat_generated[i] / gr.density[i] / gr.thermal_capacity[i]
 
+    # Keep the left boundary weight separately when both ends use the same row.
+    single_left_loss = left[1] if n == 1 else 0.0
+
     # 2. Left boundary condition at face 1 (cell 1, x = 0):
     # Since there is no "cell 0", `left[1]` either vanishes (`NoHeatFlux`) or multiplies a known
     # boundary/ambient temperature (`Temp` or `HeatFlux`) and moves into `known[1]`.
     if t["left_boundary"] == "NoHeatFlux":
+        single_left_loss = 0.0
         # Adiabatic left end: zero heat flux across face 1, so remove `left[1]` from `center[1]`.
         left[1] = 0.0
         center[1] = right[1]
@@ -609,6 +645,7 @@ def _transport_coefficients(
             left[1] = 0.0
         else:
             # If h_left == 0, there is zero convective heat transfer at face 1 (same as adiabatic for convection).
+            single_left_loss = 0.0
             left[1] = 0.0
             center[1] = right[1]
     else:
@@ -621,8 +658,9 @@ def _transport_coefficients(
     # boundary/ambient temperature (`Temp` or `HeatFlux`) and moves into `known[n]`.
     if t["right_boundary"] == "NoHeatFlux":
         # Adiabatic right end: zero heat flux across face n + 1, so remove `right[n]` from `center[n]`.
+        # In a one-cell mesh the left boundary was already assembled into this row.
+        center[n] = single_left_loss if n == 1 else left[n]
         right[n] = 0.0
-        center[n] = left[n]
     elif t["right_boundary"] == "HeatFlux":
         # Convective right end: if h_right > 0, heat flows to/from ambient air `right_air_temperature_k`.
         if float(t["right_convection"]) > 0:
@@ -631,8 +669,8 @@ def _transport_coefficients(
             right[n] = 0.0
         else:
             # If h_right == 0, zero convective flux across face n + 1.
+            center[n] = single_left_loss if n == 1 else left[n]
             right[n] = 0.0
-            center[n] = left[n]
     else:
         # Imposed temperature (`Temp`) at x = L: add `right[n] * T_right` to `known[n]` and zero out `right[n]`.
         known[n] += right[n] * float(t["right_temperature_k"])
@@ -703,8 +741,18 @@ def _step(config: dict[str, Any], gr: Grid, old: list[float]) -> list[float]:
         # Explicit Forward-Euler scheme:
         # T_i^{m+1} = known_i + left_i * T_{i-1}^m + (1 - center_i) * T_i^m + right_i * T_{i+1}^m
         for i in range(1, n + 1):
+            if not math.isfinite(center[i]):
+                raise ValueError(f"Explicit loss coefficient is not finite at cell {i}. Reduce the time step and check inputs.")
+            if center[i] > 1.0 + 1e-12:
+                limit = config["controls"]["time_step_s"] / center[i]
+                raise ValueError(
+                    f"Explicit time step is too large at cell {i}: the loss coefficient b = {center[i]:.6g} "
+                    f"exceeds 1. Try a time step below {limit:.6g} s or use Implicit."
+                )
             # Diagonal weight in the explicit update is `1 - center[i]`.
             center[i] = 1 - center[i]
+        if n == 1:
+            return [0.0, known[1] + center[1] * old[1]]
         # Update cell 1 (left boundary cell; `left[1]` is already incorporated into `known[1]`).
         result[1] = known[1] + center[1] * old[1] + right[1] * old[2]
         # Update interior cells i = 2..n-1.
@@ -840,17 +888,44 @@ def simulate(config: dict[str, Any]) -> SimulationResult:
     dt = float(controls["time_step_s"])
     duration = float(controls["duration_s"])
     # 2. Main time-marching loop: advance by `dt` until `time >= duration`.
+    for cell, value in enumerate(temperatures[0], 1):
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"Initial temperature at cell {cell} must be above 0 K.")
+    observed_min = min(temperatures[0])
+    observed_max = max(temperatures[0])
     while time < duration:
         # Advance the simulation clock by one time step Δt.
+        if time + dt <= time or not math.isfinite(time + dt):
+            raise ValueError("The time step cannot advance the simulation clock. Check duration and time step.")
         time += dt
         # Save the previous time step's temperatures in `old`.
         old = new.copy()
         # Compute the new cell temperatures at `time`.
-        new = _step(config, gr, old)
+        try:
+            new = _step(config, gr, old)
+        except (OverflowError, ZeroDivisionError) as exc:
+            raise ValueError(f"Temperature update failed at t={time:.9g} s. Check the inputs and reduce the time step.") from exc
+        except ValueError as exc:
+            raise ValueError(f"At t={time:.9g} s: {exc}") from exc
+        for cell in range(1, n + 1):
+            value = new[cell]
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(
+                    f"Cell {cell} reached {value:.6g} K at t={time:.9g} s. "
+                    "Check temperatures and sources, or reduce the time step."
+                )
+            observed_min = min(observed_min, value)
+            observed_max = max(observed_max, value)
         # Whenever `time` reaches or passes the next scheduled output time `print_time`, record the state.
         if time >= print_time:
             # Evaluate cross-sectional heat fluxes across all n + 1 faces.
-            flux = _heat_flux(config, gr, new, old)
+            try:
+                flux = _heat_flux(config, gr, new, old)
+            except (OverflowError, ZeroDivisionError) as exc:
+                raise ValueError(f"Face heat rate could not be computed at t={time:.9g} s. Check temperature and geometry inputs.") from exc
+            for face in range(1, n + 2):
+                if not math.isfinite(flux[face]):
+                    raise ValueError(f"Heat rate at face {face} is not finite at t={time:.9g} s.")
             # Append the current time and 0-based temperature/flux slices to the printed history.
             times.append(time)
             temperatures.append(new[1 : n + 1].copy())
@@ -859,29 +934,32 @@ def simulate(config: dict[str, Any]) -> SimulationResult:
             # Schedule the next output print time by adding `output_interval_s`.
             print_time += float(controls["output_interval_s"])
 
-    # 3. Check whether any printed temperature fell below `minimum_k` or exceeded `maximum_k`.
+    # 3. Check the full computed trajectory, including steps between saved rows.
     warnings: list[str] = []
     min_k = float(tcfg.get("minimum_k") or 0.0)
     max_k = float(tcfg.get("maximum_k") or 0.0)
-    # Flatten all finite printed temperatures to find the global minimum and maximum over the simulation.
-    all_temps = [val for row in temperatures for val in row if math.isfinite(val)]
-    if all_temps:
-        observed_min = min(all_temps)
-        observed_max = max(all_temps)
-        # Warn if a positive `minimum_k` threshold was configured and the temperature dropped below it.
-        if min_k > 0.0 and observed_min < min_k:
-            warnings.append(
-                f"Computed temperature reached {observed_min:.4g} K, below Minimum value ({min_k:.4g} K)."
-            )
-        # Warn if a valid `maximum_k` threshold was configured and the temperature exceeded it.
-        if max_k > 0.0 and max_k > min_k and observed_max > max_k:
-            warnings.append(
-                f"Computed temperature reached {observed_max:.4g} K, above Maximum value ({max_k:.4g} K)."
-            )
+    if min_k > 0.0 and observed_min < min_k:
+        warnings.append(
+            f"Computed temperature reached {observed_min:.4g} K, below Minimum value ({min_k:.4g} K)."
+        )
+    if max_k > 0.0 and max_k > min_k and observed_max > max_k:
+        warnings.append(
+            f"Computed temperature reached {observed_max:.4g} K, above Maximum value ({max_k:.4g} K)."
+        )
 
-    # 4. Automatically compute the 1D steady-state analytical temperature and heat-flux profiles
-    # from the exact same `config` and `gr` so every 2D chart can overlay the analytical solution.
-    an_temps, an_fluxes = evaluate_analytical_from_numerical(config, gr)
+    # 4. Compute a steady reference when the simplified analytical problem admits one.
+    note = "Analytical curves use a steady 1D model with averaged properties and convection. They omit radiation."
+    try:
+        an_temps, an_fluxes = evaluate_analytical_from_numerical(config, gr, temperatures[0])
+    except NoAnalyticalReference as exc:
+        an_temps, an_fluxes = [], []
+        note = str(exc)
+    except (OverflowError, ZeroDivisionError):
+        an_temps, an_fluxes = [], []
+        note = "No analytical reference: the steady comparison exceeded the numerical range."
+    if not all(math.isfinite(v) for v in (*an_temps, *an_fluxes)):
+        an_temps, an_fluxes = [], []
+        note = "No analytical reference: the steady comparison exceeded the numerical range."
     # Return the complete `SimulationResult` object.
     return SimulationResult(
         times,
@@ -892,4 +970,6 @@ def simulate(config: dict[str, Any]) -> SimulationResult:
         warnings,
         an_temps,
         an_fluxes,
+        time,
+        note,
     )

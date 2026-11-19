@@ -11,9 +11,8 @@ browser:
    dimensions, boundary condition parameters, radiation surroundings temperatures,
    and initialization fields that are physically active for the current selections.
 3. **Unified Simulation & Results (`numerical_results`)**: Runs the transient
-   finite-volume solver (`simulate`), which automatically evaluates the exact
-   1D steady-state analytical solution from the same inputs and overlays the
-   dashed `"Analytical"` comparison curve on every 2D chart, alongside the
+   finite-volume solver (`simulate`), which evaluates a simplified steady
+   reference when available and overlays it as a dashed line, alongside the
    interactive 3D animated fin view, data tables, and CSV/JSON downloads.
 """
 
@@ -23,6 +22,7 @@ import copy  # Used to copy configuration state before applying widget updates
 import hashlib  # Used to hash uploaded JSON files so the same upload is not re-processed on every rerun
 import json  # Used to parse uploaded JSON presets and serialize exported JSON files
 import re  # Used to strip epoch suffixes (`__1`, `__2`, ...) from Streamlit widget keys
+from itertools import zip_longest
 from pathlib import Path  # Cross-platform filesystem path handling
 
 import pandas as pd  # Used to build editable tables (`st.data_editor`) and CSV exports
@@ -52,7 +52,7 @@ NUMERICAL_WIDGET_KEYS = {
     "right_type", "right_temp", "right_h", "right_air", "right_rad",
     "right_sur", "lateral_flux", "lateral_h", "lateral_air", "lateral_rad",
     "lateral_sur", "initial_type", "initial_uniform", "initial_cells",
-    "graph_cells", "graph_percent", "remove_section", "graph_defaults",
+    "graph_cells", "graph_faces", "graph_percent", "remove_section", "graph_defaults",
 }
 
 # Configure the browser tab title and wide two-column page layout.
@@ -342,9 +342,14 @@ def numerical_input_form(config: dict) -> tuple[dict, str, int | None]:
 
         # 6. Graph selection controls (which cells to plot vs. time, and which time percentages to plot vs. x):
         st.subheader("Graph selections")
-        st.caption("Cell indices use 1 for the first cell. Profile positions are percentages of the printed simulation times.")
+        st.caption("Temperature histories use cell centres, heat-rate histories use faces. Profile percentages select a saved row; 100% is the last saved row.")
         graph = updated["graphs"]
         cells_text = st.text_input("Time series at cells (comma separated)", value=", ".join(map(str, graph["cells"])), key=numerical_key("graph_cells"))
+        faces_text = st.text_input(
+            "Heat rate at faces (comma separated)", value=", ".join(map(str, graph.get("faces", []))),
+            key=numerical_key("graph_faces"),
+            help="Face 1 is the left end; face N+1 is the right end. Leave blank to reuse the cell indices.",
+        )
         percent_text = st.text_input("Longitudinal profiles at percentages (comma separated)", value=", ".join(map(str, graph["percentages"])), key=numerical_key("graph_percent"))
         preset_clicked = st.button("Use default graph selections", key=numerical_key("graph_defaults"), help="Populate default cell indices and time percentages for the output plots.")
         run_clicked = st.button("Run numerical simulation", type="primary")
@@ -353,11 +358,17 @@ def numerical_input_form(config: dict) -> tuple[dict, str, int | None]:
     action = "run" if run_clicked else "add" if add_clicked else "remove" if remove_clicked else "defaults" if preset_clicked else ""
     if action == "defaults":
         # Populate standard default graph selections.
-        graph["cells"] = [1, 5, 10]
+        n = sum(1 if d["gas_gap"] else (d["n_cells"] or 0) for d in updated["domains"])
+        graph["cells"] = [cell for cell in (1, 5, 10) if cell <= n]
+        graph["faces"] = [1, n + 1] if n else []
         graph["percentages"] = [0, 10, 20, 50, 80, 100]
     else:
         # Parse comma-separated cell indices and time percentages entered by the student.
         graph["cells"] = [float(item.strip()) for item in cells_text.split(",") if item.strip()]
+        if faces_text.strip():
+            graph["faces"] = [float(item.strip()) for item in faces_text.split(",") if item.strip()]
+        else:
+            graph.pop("faces", None)
         graph["percentages"] = [float(item.strip()) for item in percent_text.split(",") if item.strip()]
     # Round cell numbers in `initial_cells` to integers.
     for item in t["initial_cells"]:
@@ -402,6 +413,13 @@ def numerical_results(config: dict, result: SimulationResult) -> None:
     # Display summary header with cell count and printed time step counts.
     st.subheader("Numerical results")
     st.caption(f"{result.grid.n} cells · {len(result.times_s)} printed temperature times · {len(result.heat_flux_times_s)} printed heat flux times")
+    st.caption(
+        f"Requested duration: {config['controls']['duration_s']:.12g} s · "
+        f"Final computed time: {result.final_computed_time_s:.12g} s · "
+        f"Last saved time: {result.times_s[-1]:.12g} s"
+    )
+    if len(result.times_s) == 1:
+        st.warning("Only the initial state was saved. Reduce the output interval to save transient results.")
     # Display any temperature threshold warnings recorded during the simulation.
     for warning in getattr(result, "warnings", ()):
         st.warning(warning)
@@ -411,27 +429,34 @@ def numerical_results(config: dict, result: SimulationResult) -> None:
         # Build all 2D chart specifications (including the overlaid analytical curves).
         from finmodel.visualization import build_chart_specs
 
-        specs = build_chart_specs(result, config["graphs"])
-        if not specs:
-            st.info("Select at least one cell or profile percentage to display graphs.")
+        st.caption(result.analytical_note)
+        try:
+            specs = build_chart_specs(result, config["graphs"])
+        except ValueError as exc:
+            st.error(f"Graph selection: {exc}. The simulation results are available in Tables and Export.")
+            specs = None
+        if specs == []:
+            st.info("Select at least one cell, face or profile percentage to display graphs.")
         # Partition into left-column Temperature charts and right-column CrossSectionHeatFlux charts.
-        temperature_specs = [spec for spec in specs if spec.property_name == "Temperature"]
-        flux_specs = [spec for spec in specs if spec.property_name == "CrossSectionHeatFlux"]
+        temperature_specs = [spec for spec in specs or [] if spec.property_name == "Temperature"]
+        flux_specs = [spec for spec in specs or [] if spec.property_name == "CrossSectionHeatFlux"]
         # Render paired Temperature (left) and CrossSectionHeatFlux (right) charts side by side.
-        for index, (left, right) in enumerate(zip(temperature_specs, flux_specs)):
+        for index, (left, right) in enumerate(zip_longest(temperature_specs, flux_specs)):
             a, b = st.columns(2)
-            with a:
-                _plot(left.title, left.x_axis, left.y_axis,
-                      [(s.name, list(s.x_values), list(s.y_values)) for s in left.series],
-                      y_bounds=(left.y_min, left.y_max),
-                      x_bounds=(left.x_min, left.x_max),
-                      height_px=left.height_px, key=f"temperature_chart_{index}")
-            with b:
-                _plot(right.title, right.x_axis, right.y_axis,
-                      [(s.name, list(s.x_values), list(s.y_values)) for s in right.series],
-                      y_bounds=(right.y_min, right.y_max),
-                      x_bounds=(right.x_min, right.x_max),
-                      height_px=right.height_px, key=f"flux_chart_{index}")
+            if left is not None:
+                with a:
+                    _plot(left.title, left.x_axis, left.y_axis,
+                          [(s.name, list(s.x_values), list(s.y_values)) for s in left.series],
+                          y_bounds=(left.y_min, left.y_max),
+                          x_bounds=(left.x_min, left.x_max),
+                          height_px=left.height_px, key=f"temperature_chart_{index}")
+            if right is not None:
+                with b:
+                    _plot(right.title, right.x_axis, right.y_axis,
+                          [(s.name, list(s.x_values), list(s.y_values)) for s in right.series],
+                          y_bounds=(right.y_min, right.y_max),
+                          x_bounds=(right.x_min, right.x_max),
+                          height_px=right.height_px, key=f"flux_chart_{index}")
     with tab_3d:
         # Render the rotatable 3D fin mesh with Play/Pause buttons and time slider.
         st.caption("Rotate the fin with the mouse. Use Play, Pause, or the time slider to inspect each printed temperature state.")
@@ -572,7 +597,7 @@ def numerical_page() -> None:
     st.title("Fin heat transfer: numerical solution")
     st.caption(
         "Enter numerical inputs, choose one of the saved cases, or load a saved JSON file, then run the simulation. "
-        "The 1D steady-state analytical solution is automatically calculated from the same inputs and plotted on every 2D graph."
+        "The graphs include a simplified steady-state reference when one is available."
     )
 
     # Top Loader Option 1: Select one of the 14 pre-programmed teaching cases (`Case 1` .. `Case 14`).
