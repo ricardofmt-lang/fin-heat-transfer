@@ -116,6 +116,17 @@ def test_app_shows_consecutive_steps_even_with_a_coarse_output_interval():
     assert preview is not None
 
 
+def test_app_embeds_camera_and_gif_controls_in_one_frame():
+    app = AppTest.from_file(str(APP)).run()
+    app.selectbox(key="saved_case").select(get_saved_case_names()[0]).run()
+    next(b for b in app.button if b.label == "Run numerical simulation").click().run(timeout=30)
+    assert not app.exception and not app.error
+
+    [iframe] = app.get("iframe")
+    assert "__finCameraHandlers" in iframe.proto.srcdoc
+    assert "Download 3D GIF" in iframe.proto.srcdoc
+
+
 def test_radiating_end_reports_irradiation_linear_in_absorptivity():
     cfg = case(3)
     cfg["temperature"].update(initial_type="DEFAULT", right_boundary="HeatFlux",
